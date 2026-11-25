@@ -5225,6 +5225,9 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        // A host callback can consume the mip mask produced by an earlier refresh.
+                        batch.refresh_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
