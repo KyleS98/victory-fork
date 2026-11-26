@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -347,6 +347,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    structure::set_entry_limited(lower::thread_limited(&native));
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

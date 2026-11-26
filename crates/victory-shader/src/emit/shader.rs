@@ -78,6 +78,12 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// upstream VIctory pull request #2312, Xvania7; run 319 measured indirect
 /// compute records asking 115,200 groups, clamped to 65,535 before.)
 pub const USER_DISPATCH_SPREAD: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the number of threads the
+/// dispatch runs along x, for a dispatch by thread counts (the console's `DispatchX` with
+/// the card's "use thread dimensions" bit); `u32::MAX` for a dispatch by groups. A lane whose
+/// thread (group x group size + thread in group) is not below it starts outside EXEC
+/// (`structure::set_entry_limited`).
+pub const USER_THREAD_LIMIT: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

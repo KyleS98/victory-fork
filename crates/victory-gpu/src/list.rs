@@ -1381,14 +1381,62 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch whose flags are the console
+/// card's own dispatch bits (the ray-tracing structure builder dispatches
+/// its in-place stages this way). Bit 5 (0x20, "use thread dimensions")
+/// makes `x`, `y`, `z` counts of THREADS, not of thread groups: the card
+/// runs as many groups as hold them and, in the last one, only the threads
+/// below the count. Bit 15 (0x8000) says the program's waves have 32
+/// lanes, which its container says too.
+///
+/// The flags were passed over and the counts taken for groups: a stage
+/// asked to make one tree level's 1,606 nodes ran 1,606 groups of 64
+/// threads and made 102,784, from whatever lay behind the level's records,
+/// megabytes past the structure's end.
+///
+/// Here the counts become group counts by the program's group size, and
+/// the host is told the thread count along x, from which the translated
+/// program gives each lane its place in or outside EXEC on entry
+/// (`victory_shader::emit::USER_THREAD_LIMIT`). `VICTORY_DISPATCH_THREADS=0`:
+/// the counts as groups, as before.
+/// shortcut: counts along y and z are rounded up to groups, no more.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        const THREAD_DIMENSIONS: u32 = 1 << 5;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_THREADS").is_none_or(|v| v != "0"));
+        let (mut gx, mut gy, mut gz) = (x, y, z);
+        let mut limited = false;
+        if on && flags & THREAD_DIMENSIONS != 0 {
+            let mut threads = None;
+            with_state(this, |_, s| threads = crate::pipeline::compute_threads(s.pipeline_now() as This));
+            match threads {
+                Some([tx, ty, tz]) if tx > 0 && ty > 0 && tz > 0 => {
+                    (gx, gy, gz) = (x.div_ceil(tx), y.div_ceil(ty), z.div_ceil(tz));
+                    limited = true;
+                }
+                _ => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!("a dispatch by thread counts of a program whose group size is not known: taken as groups")
+                    });
+                }
+            }
+        }
+        // The lanes of the last group past the count start outside EXEC
+        // (one thread is one group of which one lane runs).
+        if limited {
+            with_state(this, |_, s| s.set_thread_limit(Some(x)));
+        }
+        state::dispatch(this, gx, gy, gz);
+        if limited {
+            with_state(this, |_, s| s.set_thread_limit(None));
+        }
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }

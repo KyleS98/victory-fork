@@ -815,6 +815,17 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     pass(&mut kind, &mut firsts, true)
 }
 
+/// Whether a program's lanes start in EXEC only below the dispatch's thread count
+/// (`structure::set_entry_limited`; `VICTORY_THREAD_LIMIT=0`: every lane, as before): the
+/// compute programs with a spilled user-data table, the console's ray-tracing structure
+/// builder, whose in-place stages are dispatched by thread counts.
+pub(super) fn thread_limited(native: &NativeProgram) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
+        && native.stage == HwStage::Cs
+        && crate::spill::is_spilled(native)
+}
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -2224,6 +2235,27 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if crate::structure::entry_limited()
+            && let StageIo::Cs(cs) = &self.x.native.io
+            && let Some(&(_, lo)) = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC))
+        {
+            // EXEC on entry, a lane's own bit: its thread along x is below the count the
+            // dispatch runs (`shader.rs` `USER_THREAD_LIMIT`).
+            use super::shader::USER_THREAD_LIMIT;
+            let e = self.s.entry;
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let Val::I32(thread) = self.thread_id(0) else {
+                return Err(unsupported(0, "a thread id for the dispatch's thread count"));
+            };
+            let size = self.s.m.i32(cs.threads[0]);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let at = self.s.m.bin(e, Bin::Add, first, thread);
+            let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, 0);
+            let bit = self.s.m.cmp(e, pred::IULT, at, limit);
+            self.lane_bits.insert(lo, bit);
+        }
         // A compute program that reads its group id x may run spread across
         // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
         // stages, near the root signature's 64 dwords), nor one whose first

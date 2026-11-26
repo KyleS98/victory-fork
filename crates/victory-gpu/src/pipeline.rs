@@ -279,6 +279,29 @@ impl Shader {
     }
 }
 
+/// The thread-group size (`numthreads`) of the compute program of the
+/// title's pipeline `this`; none if it is no compute pipeline or its
+/// program does not parse.
+#[cfg(windows)]
+pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let [shader] = &p.shaders[..] else { return None };
+    if shader.stage != "compute" {
+        return None;
+    }
+    let c = Container::parse(&shader.container).ok()?;
+    let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+    programs.iter().find_map(|n| match &n.io {
+        StageIo::Cs(cs) => Some(cs.threads),
+        _ => None,
+    })
+}
+
 /// Whether a console container's code tests rays against the nodes of a
 /// ray-tracing structure.
 #[cfg(windows)]
