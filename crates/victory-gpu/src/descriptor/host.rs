@@ -690,6 +690,30 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether every slot of a table a draw binds counts as a table's slot,
+/// not only those that hold texture views (`VICTORY_TABLED_ALL=1`; off by
+/// default).
+///
+/// The title writes its per-draw tables into its heap as bytes, every
+/// frame. A table that holds a constant buffer is made afresh for its draw
+/// in slots of our own, so the title's slots of it are read by nothing
+/// unless a shader picks them by index. The pass over records copied in as
+/// bytes (`super::sync_heaps`) cannot know that. It leaves a table's
+/// TEXTURE slots to the draws that read them, and took every other changed
+/// record there for one a shader may pick: a buffer view "left for later"
+/// (its host slot made null), which the once-a-frame pass over buffer views
+/// picked by index (`State::heap_buffers`) then makes, with its memory
+/// looked at, on a recording thread.
+///
+/// With the switch such a slot is left to its draws for as long as a
+/// table's texture slot is ([`TABLED_FRAMES`]). What it risks is what that
+/// rule risks for textures: a slot that was a table's and is then picked
+/// by index only is not noticed until the frames are over.
+pub(crate) fn tabled_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_ALL").is_some_and(|v| v == "1"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1862,6 +1886,15 @@ impl HostHeap {
     /// pass would have, for a shader that picks it by index all the same.
     pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
         self.tabled_in(index, read, crate::frame::current());
+    }
+
+    /// Title slot `index` is one of a table a draw binds, whatever it
+    /// holds (with [`tabled_all`]): the pass over records copied in as
+    /// bytes leaves it to its draws, as it leaves a table's texture slots.
+    pub(crate) fn table_slot(&self, index: u32) {
+        if tabled_all() {
+            self.tabled_in(index, false, crate::frame::current());
+        }
     }
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
