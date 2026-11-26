@@ -4233,6 +4233,38 @@ mod registration_tests {
     }
 }
 
+#[cfg(test)]
+mod window_cache_tests {
+    use super::{LOOSE, WINDOW, lookup_cached, tables_changed};
+    use std::sync::Arc;
+
+    #[test]
+    fn cached_window_removed_by_sweep_is_replaced() {
+        if crate::host::host().is_none() {
+            eprintln!("SKIP: no D3D12 device for the window allocation");
+            return;
+        }
+        let memory = vec![0u8; 2 * WINDOW as usize];
+        let address = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
+        let find = || lookup_cached(address, 64, false).expect("host window");
+        let old = find();
+        assert!(old.window);
+        // Creating the first window advances the generation. Warm the
+        // cache in that generation before modeling the sweep handoff.
+        assert!(Arc::ptr_eq(&find(), &old));
+        assert!(Arc::ptr_eq(&find(), &old));
+        let key = (old.start, old.len);
+        let removed = LOOSE.lock().unwrap().remove(&key).unwrap();
+        assert!(Arc::ptr_eq(&removed, &old));
+        // The sweep has removed the entry and still owns its Arc, before
+        // publishing its generation. A racing weak upgrade can succeed.
+        let next = find();
+        LOOSE.lock().unwrap().remove(&key);
+        tables_changed();
+        assert!(!Arc::ptr_eq(&next, &old));
+    }
+}
+
 /// Since the last frame line: asks answered from a thread's own memory of
 /// them, and asks that went to the tables.
 pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -4268,6 +4300,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if !lookup_cache() {
         return lookup_tables(address, len, any);
     }
+    lookup_cached(address, len, any)
+}
+
+fn lookup_cached(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let changes = TABLES_CHANGED.load(Ordering::Acquire);
     let found = FOUND.with(|f| {
         let f = &mut *f.borrow_mut();
@@ -4277,17 +4313,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
     });
-    if let Some(shadow) = found {
-        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
-        if shadow.window {
-            // As `loose` notes an ask of a window it hands out.
-            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-            shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
-            if len <= 1 {
-                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-            }
+    if let Some(shadow) = found.filter(|shadow| {
+        if !shadow.window {
+            return true;
         }
+        // The sweeper holds LOOSE from the idle check through removal.
+        // A cache hit has to hand the window out on the same side of that
+        // boundary as a normal lookup. A removed window can still be alive.
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.get(&(shadow.start, shadow.len)).is_some_and(|entry| Arc::ptr_eq(entry, shadow)) {
+            return false;
+        }
+        note_window(shadow, address, address.saturating_add(len.max(1)), len <= 1);
+        true
+    }) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
         return Some(shadow);
     }
     LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
@@ -4521,6 +4561,16 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Called with LOOSE held, including when handing out a cached window.
+fn note_window(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
@@ -4537,24 +4587,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     } else {
         named
     };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
     if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
+        note_window(shadow, address, end, unsized_ask);
         return Some(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
+        note_window(&shadow, address, end, unsized_ask);
         map.insert((start, len), shadow.clone());
         tables_changed();
         return Some(shadow);
@@ -4569,7 +4610,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         shadow.window = true;
         shadow.uploaded = len;
         let shadow = Arc::new(shadow);
-        note(&shadow);
+        note_window(&shadow, address, end, unsized_ask);
         map.insert((start, len), shadow.clone());
         tables_changed();
         return Some(shadow);
@@ -4608,7 +4649,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let _ = card.me.set(Arc::downgrade(&shadow));
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
+    note_window(&shadow, address, end, unsized_ask);
     map.insert((start, len), shadow.clone());
     tables_changed();
     Some(shadow)
