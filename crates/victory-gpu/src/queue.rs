@@ -1424,6 +1424,12 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
 /// from a visible one on another.
 #[cfg(windows)]
 fn present_shape(frame: u64, planes: u32, plane_parameters: *const Plane) {
+    // Nothing is looked up when the line would not be written: finding the
+    // host resource takes the resource table's lock and notes a use of the
+    // texture, on every present (review of pull request #835).
+    if !tracing::enabled!(tracing::Level::INFO) {
+        return;
+    }
     type Shape = (u32, u32, i32, u64, u32);
     static LAST: std::sync::Mutex<Option<Shape>> = std::sync::Mutex::new(None);
     // SAFETY: the title passes `planes` plane descriptions.
