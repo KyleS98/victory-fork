@@ -1959,23 +1959,42 @@ impl HostHeap {
         self.table_slot_age(index, frame, frames).is_some()
     }
 
-    /// If the pass over records copied in as bytes leaves title slot
-    /// `index` to its draws in frame `frame`: the first frame in which it
-    /// no longer does, unless a draw binds the slot's table again. Left
-    /// are a table's texture slot lately ([`HostHeap::tabled_age`]), and
-    /// with [`tabled_all`] any slot of a table a draw bound within
-    /// [`tabled_all_frames`] frames.
-    fn left_until(&self, index: u32, frame: u64) -> Option<u64> {
-        let texture = self.tabled_age(index, frame).map(|age| frame.saturating_add(TABLED_FRAMES + 1 - age));
+    /// If [`tabled_all`]'s own stamp leaves title slot `index` to its
+    /// draws in frame `frame` (a draw bound a table the slot is one of
+    /// within [`tabled_all_frames`] frames): the first frame in which it
+    /// no longer does, unless a draw binds the table again.
+    fn table_slot_until(&self, index: u32, frame: u64) -> Option<u64> {
         let frames = tabled_all_frames();
-        let any = self.table_slot_age(index, frame, frames).map(|age| frame.saturating_add(frames + 1 - age));
-        texture.max(any)
+        self.table_slot_age(index, frame, frames).map(|age| frame.saturating_add(frames + 1 - age))
     }
 
-    /// Whether [`HostHeap::left_until`] leaves title slot `index` in frame
-    /// `frame`.
+    /// Whether the pass over records copied in as bytes leaves title slot
+    /// `index` to its draws in frame `frame`: a table's texture slot lately
+    /// ([`HostHeap::tabled_lately`]), or with [`tabled_all`] any slot of a
+    /// table a draw bound within [`tabled_all_frames`] frames.
     fn left_to_draws(&self, index: u32, frame: u64) -> bool {
-        self.left_until(index, frame).is_some()
+        self.tabled_lately(index, frame) || self.table_slot_until(index, frame).is_some()
+    }
+
+    /// For a changed record the pass leaves in title slot `index` in frame
+    /// `frame` ([`HostHeap::left_to_draws`]): `retry_at` made the frame its
+    /// page is to be read again in, if that is before the frame it holds.
+    ///
+    /// Only what the switch's own stamp left is asked for again. A record
+    /// left by the texture queue's rule is taken when its page is next
+    /// written, with the switch as without it: that rule is not this
+    /// switch's to change. (Read again when the rule's 240 frames ended, a
+    /// slot that had gone on showing the texture its draws made is made
+    /// anew from a record nothing has read since, and waits in the queue
+    /// of textures picked by index. In one of two runs that did so the
+    /// cell's window frame drew flat yellow from its first minute to its
+    /// last; in none of nine without.)
+    fn retry_left(&self, index: u32, frame: u64, retry_at: Option<&mut u64>) {
+        if let Some(at) = retry_at
+            && let Some(until) = self.table_slot_until(index, frame)
+        {
+            *at = (*at).min(until);
+        }
     }
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
@@ -2442,13 +2461,13 @@ impl HostHeap {
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
                 return false;
             }
-            if !tables
-                && let Some(at) = retry_at
-                && let Some(until) = self.left_until(index, crate::frame::current())
-            {
-                *at = (*at).min(until);
-                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return false;
+            if !tables && retry_at.is_some() {
+                let frame = crate::frame::current();
+                if self.left_to_draws(index, frame) {
+                    self.retry_left(index, frame, retry_at);
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
             }
             *last = print;
         }
@@ -2528,10 +2547,8 @@ impl HostHeap {
                 }
                 // A table's slot lately: left to its draws. With the retry
                 // enabled, the page is read again when the stamp can expire.
-                if !tables && let Some(until) = self.left_until(index as u32, frame) {
-                    if let Some(at) = retry_at.as_deref_mut() {
-                        *at = (*at).min(until);
-                    }
+                if !tables && self.left_to_draws(index as u32, frame) {
+                    self.retry_left(index as u32, frame, retry_at.as_deref_mut());
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
@@ -5079,6 +5096,19 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             ),
             (8, 1)
         );
+        // A table's texture slot (the texture queue's stamp, which is there
+        // without the switch too): left as before, and its page is not
+        // asked for again on its account.
+        page[7 * STEP + 16] = 1;
+        heap.tabled_in(7, false, frame + 2 * frames + 6);
+        assert_eq!(retry(&heap, &page, frame + 2 * frames + 6), ((8, 0), u64::MAX));
+        // Both stamps: asked for again when the switch's own ends, and
+        // then left to the texture queue's rule with nothing more asked.
+        heap.table_slot_in(7, frame + 2 * frames + 6);
+        assert_eq!(retry(&heap, &page, frame + 2 * frames + 6), ((8, 0), frame + 3 * frames + 7));
+        if frames < TABLED_FRAMES {
+            assert_eq!(retry(&heap, &page, frame + 3 * frames + 7), ((8, 0), u64::MAX));
+        }
     }
 
     #[test]
