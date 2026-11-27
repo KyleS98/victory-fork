@@ -63,6 +63,8 @@ pub(crate) struct Heap {
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    #[cfg(windows)]
+    table_retries: Option<std::sync::Mutex<TableRetries>>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -170,6 +172,73 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Pages with a changed descriptor that the table stamp left to a draw.
+/// Only one deadline per page is needed: that read finds the current bytes
+/// and reschedules any slots still left to their draws.
+#[cfg(windows)]
+#[derive(Default)]
+struct TableRetries {
+    pages: std::collections::BTreeMap<usize, u64>,
+    next: Option<u64>,
+}
+
+#[cfg(windows)]
+impl TableRetries {
+    fn include_due(&mut self, frame: u64, start: usize, end: usize, ranges: &mut Vec<(usize, usize)>) {
+        if self.next.is_none_or(|at| at > frame) {
+            return;
+        }
+        self.next = None;
+        let dirty = ranges.len();
+        for (&page, &at) in &self.pages {
+            if at <= frame {
+                let from = page.max(start);
+                let to = (page + crate::watch::PAGE).min(end);
+                if from < to {
+                    ranges.push((from, to));
+                }
+            } else {
+                self.next = Some(self.next.map_or(at, |next| next.min(at)));
+            }
+        }
+        if ranges.len() == dirty {
+            return;
+        }
+        // Use the original page order even when a deferred read overlaps
+        // a fresh write. Mirroring placed views can invalidate other slots.
+        ranges.sort_unstable();
+        let mut kept = 0;
+        for i in 0..ranges.len() {
+            let (from, to) = ranges[i];
+            if kept > 0 && from <= ranges[kept - 1].1 {
+                ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+            } else {
+                ranges[kept] = (from, to);
+                kept += 1;
+            }
+        }
+        ranges.truncate(kept);
+    }
+
+    fn after_read(&mut self, page: usize, retry_at: u64) {
+        if retry_at == u64::MAX {
+            self.pages.remove(&page);
+        } else {
+            self.pages.insert(page, retry_at);
+            self.next = Some(self.next.map_or(retry_at, |next| next.min(retry_at)));
+        }
+    }
+
+    fn after_failed_read(&mut self, page: usize, frame: u64) {
+        // The page still owes a read. Do not loop on it within this frame
+        // if the title unmapped it. Unrelated read failures keep their
+        // existing behavior.
+        if self.pages.get(&page).is_some_and(|&at| at <= frame) {
+            self.after_read(page, frame.saturating_add(1));
+        }
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -211,7 +280,15 @@ pub(crate) fn sync_heaps() {
             end as usize
         };
         let asking = std::time::Instant::now();
-        let ranges = written.take(start as usize, looked_end);
+        let mut ranges = written.take(start as usize, looked_end);
+        let mut retries = heap
+            .table_retries
+            .as_ref()
+            .map(|r| r.lock().unwrap_or_else(|e| e.into_inner()));
+        let retry_frame = retries.as_ref().map(|_| crate::frame::current());
+        if let (Some(retries), Some(frame)) = (&mut retries, retry_frame) {
+            retries.include_due(frame, start as usize, looked_end, &mut ranges);
+        }
         SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -227,12 +304,20 @@ pub(crate) fn sync_heaps() {
                 SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
                 if read {
                     pages += 1;
+                    let mut retry_at = u64::MAX;
+                    let mut record_retry = retries.as_ref().map(|_| &mut retry_at);
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(
+                            slots,
+                            (start, step),
+                            from,
+                            &page_bytes,
+                            record_retry.as_deref_mut(),
+                        );
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -252,10 +337,15 @@ pub(crate) fn sync_heaps() {
                         looked += 1;
                         // Only a record that is not the one last seen there
                         // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
+                        if host.mirror_copied(index as u32, handle, record, record_retry.as_deref_mut()) {
                             mirrored += 1;
                         }
                     }
+                    if let Some(retries) = &mut retries {
+                        retries.after_read(page, retry_at);
+                    }
+                } else if let (Some(retries), Some(frame)) = (&mut retries, retry_frame) {
+                    retries.after_failed_read(page, frame);
                 }
                 page += crate::watch::PAGE;
             }
@@ -1415,6 +1505,9 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        table_retries: (placed && visible && desc.kind == VIEWS_KIND && host::tabled_all())
+            .then(std::sync::Mutex::default),
     });
     #[cfg(windows)]
     if visible {
@@ -1674,6 +1767,38 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn table_retries_merge_dirty_pages_and_reschedule_failed_reads() {
+        const PAGE: usize = crate::watch::PAGE;
+        let mut retries = TableRetries::default();
+        retries.after_read(PAGE, 8);
+        retries.after_read(2 * PAGE, 8);
+        retries.after_read(3 * PAGE, 9);
+
+        let mut dirty = vec![(2 * PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)];
+        retries.include_due(7, 0, 5 * PAGE, &mut dirty);
+        assert_eq!(dirty, [(2 * PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)]);
+        retries.include_due(8, 0, 5 * PAGE, &mut dirty);
+        assert_eq!(dirty, [(PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)]);
+        retries.after_failed_read(PAGE, 8);
+        retries.after_read(2 * PAGE, u64::MAX);
+
+        let mut due = Vec::new();
+        retries.include_due(8, 0, 5 * PAGE, &mut due);
+        assert!(due.is_empty());
+        retries.include_due(9, 0, 5 * PAGE, &mut due);
+        assert_eq!(due, [(PAGE, 2 * PAGE), (3 * PAGE, 4 * PAGE)]);
+        retries.after_read(PAGE, u64::MAX);
+        retries.after_read(3 * PAGE, 20);
+
+        due.clear();
+        retries.include_due(19, 0, 5 * PAGE, &mut due);
+        assert!(due.is_empty());
+        retries.include_due(20, 0, 5 * PAGE, &mut due);
+        assert_eq!(due, [(3 * PAGE, 4 * PAGE)]);
     }
 
     /// A skipped write must still reach an indexed slot once it leaves a
