@@ -11217,16 +11217,18 @@ impl Host {
                     };
                 }
                 if let Some(c) = p.compose.as_mut() {
-                    c.record(
-                        &self.device,
-                        list,
-                        &back,
-                        (p.width, p.height),
-                        texture,
-                        state.0 as u32,
-                        overlay,
-                        overlay_state,
-                    );
+                    // The first plane as with one plane: copied, bit for
+                    // bit. The second is then blended over it.
+                    list.ResourceBarrier(&[
+                        transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                    ]);
+                    list.CopyResource(&back, texture);
+                    list.ResourceBarrier(&[
+                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                        transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+                    ]);
+                    c.record(&self.device, list, &back, (p.width, p.height), overlay, overlay_state);
                     // The frame rate into the corner of what is shown, as
                     // with one plane (the box is a copy onto the back
                     // buffer; the pass above leaves it in the present
