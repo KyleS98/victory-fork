@@ -1836,7 +1836,8 @@ mod tests {
         assert_eq!(host::tabled_all(), enabled);
 
         use windows_sys::Win32::System::Memory::{
-            GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+            VirtualFree,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         const PAGE: usize = crate::watch::PAGE;
@@ -1850,6 +1851,17 @@ mod tests {
             )
         };
         assert!(!memory.is_null());
+        // Every kernel page touched, and the watch started afresh, before
+        // anything is counted. On Windows the write watch also reports a
+        // page's first touch when that is a read: the pass reads the whole
+        // 64 KiB page that holds the slot, and the fifteen kernel pages of
+        // it nothing had written then counted as written (seen on Windows
+        // 11 26200; the "no descriptor writes after the first sync" check
+        // below found 15 with the switch off).
+        // SAFETY: the allocation is PAGE bytes, committed and writable.
+        unsafe { memory.cast::<u8>().write_bytes(0, PAGE) };
+        // SAFETY: the allocation, which was made with a write watch.
+        assert_eq!(unsafe { ResetWriteWatch(memory, PAGE) }, 0);
         let mut title_heap: This = std::ptr::null();
         let desc = HeapDesc {
             kind: VIEWS_KIND,
