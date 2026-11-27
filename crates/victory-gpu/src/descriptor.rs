@@ -1676,6 +1676,132 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// A skipped write must still reach an indexed slot once it leaves a
+    /// table, even if nothing writes its descriptor page a second time.
+    #[cfg(windows)]
+    #[test]
+    fn table_slot_expiry_retries_consumed_dirty_page() {
+        const CHILD: &str = "VICTORY_TEST_TABLE_SLOT_EXPIRY";
+        const TEST: &str = "descriptor::tests::table_slot_expiry_retries_consumed_dirty_page";
+        let enabled = match std::env::var(CHILD).as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => {
+                for mode in ["0", "1"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                        .env(CHILD, mode)
+                        .env("VICTORY_TABLED_ALL", mode)
+                        .env("VICTORY_TABLED_TEXTURES", "0")
+                        .env("VICTORY_HEAP_SYNC", "1")
+                        .env("VICTORY_HEAP_SYNC_TABLES", "0")
+                        .env("VICTORY_HEAP_SYNC_PAGE", "1")
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "VICTORY_TABLED_ALL={mode}: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                return;
+            }
+        };
+        assert_eq!(host::tabled_all(), enabled);
+
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = crate::watch::PAGE;
+        const SLOT: u32 = 5;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let mut title_heap: This = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: (PAGE / 32) as u32,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement { address: memory as u64, size: PAGE as u64 };
+        assert_eq!(create(desc, placement, &mut title_heap), S_OK);
+        let heap = heap(title_heap);
+        let host = heap.host().expect("D3D12 host for descriptor sync");
+        assert!(heap.written.is_some(), "write-watched placed heap");
+        let dirty_pages = || {
+            let mut addresses = [0usize; PAGE / 4096];
+            let mut count = addresses.len();
+            let mut granularity = 0;
+            // SAFETY: the allocation and all three result arguments are live.
+            // Flags 0 checks write watch without consuming its changes.
+            let status = unsafe {
+                GetWriteWatch(
+                    0,
+                    memory,
+                    PAGE,
+                    addresses.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            };
+            assert_eq!(status, 0);
+            count
+        };
+        let handle = heap.handle(SLOT).expect("test title slot");
+        assert!(!host.buffer_slots().contains(&SLOT));
+
+        // Stamp the previously unknown slot just as a fresh table does.
+        host.table_slot(SLOT);
+        let table_frame = crate::frame::current();
+        let mut elsewhere = [0u64; 4];
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // buffer
+        resource[4] = 64; // width
+        let mut srv = [0u32; 16];
+        srv[..10].copy_from_slice(&[42, 1, 5768, 0, 0, 0, 16, 0, 0, 0]);
+        create_placed_srv(std::ptr::null(), &resource, &srv, elsewhere.as_mut_ptr() as u64);
+        // SAFETY: both slots hold 32 bytes. Only the source was made via
+        // the descriptor API, so the destination can be found only by sync.
+        unsafe { std::ptr::copy_nonoverlapping(elsewhere.as_ptr().cast::<u8>(), handle as *mut u8, 32) };
+        let key = view_and_key(handle).expect("copied descriptor").1;
+        assert_eq!(dirty_pages(), 1, "the raw descriptor copy must dirty its page");
+        sync_heaps();
+        assert_eq!(host.buffer_slots().contains(&SLOT), !enabled);
+
+        // Origin waits with a zero timeout and TOKEN_ON_TIMEOUT advance
+        // the production frame counter without presenting or sleeping.
+        for _ in 0..241 {
+            crate::frame::wait(std::ptr::null(), 0, 0, std::ptr::null(), 2, std::ptr::null_mut());
+        }
+        assert_eq!(crate::frame::current(), table_frame + 241);
+        assert_eq!(dirty_pages(), 0, "no descriptor writes after the first sync");
+        sync_heaps();
+        let registered_without_another_write = host.buffer_slots().contains(&SLOT);
+        assert_eq!(view_and_key(handle).expect("descriptor after expiry").1, key);
+
+        // Control: dirtiness elsewhere on the same page must rediscover
+        // the unmodified descriptor if the normal expiry failed to retry it.
+        // SAFETY: the byte is inside the allocated page and outside SLOT.
+        unsafe { memory.cast::<u8>().add(31).write_volatile(1) };
+        assert_eq!(dirty_pages(), 1, "the recovery control must re-dirty the page");
+        sync_heaps();
+        let registered_after_redirty = host.buffer_slots().contains(&SLOT);
+        assert_eq!(view_and_key(handle).expect("descriptor after re-dirty").1, key);
+        slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(registered_after_redirty, "a dirty page must discover the copied slot");
+        assert!(registered_without_another_write, "stamp expiry must discover the copied slot without re-dirtying its page");
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
