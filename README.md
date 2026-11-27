@@ -28,13 +28,18 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 02:15 UTC)
+## Status of this fork (2026-11-27, 06:30 UTC)
 
-**Playable for half an hour at a time, slowly: about 7 to 12 frames per second (the console runs
-30). The tester has played from the opening through the prologue and past the first boat mission.
-Then the graphics card is lost: four times, in sessions of 6, 49, 31 and 38 minutes, the last three
-on the way to the same place in the story, before the title's next save point. Cause not known
-yet. Shadowed areas are still black.**
+**Playable, slowly: about 11 world frames per second at the first boat mission at 1,500 to 3,300
+draws (usual frame 88 ms), 8.5 at 3,300 and more (115 to 120 ms); the console runs 30. The card is no
+longer the limit (53 to 66 ms a frame, the submitting thread waits for it about 0 ms); the thread that
+prepares submissions is (65 to 87 ms a frame at work). The
+open water now shows waves and the sun's path with no black patches. The tester has played from the opening through the prologue and past
+the first boat mission. The graphics card is still lost now and then 30 to 50 minutes into a session,
+before the title's next save point; cause not known yet. **New: with the ray-tracing structure builder on
+(the default) the title's ray-traced shadows and light now show once a scene has streamed in (tester,
+2026-11-27), but the frame rate falls to about 0.2 to 3 a second while it runs; set
+`VICTORY_BVH_BUILDER=0` to play at the speeds above.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -44,13 +49,172 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
 | Saves | the game autosaves a checkpoint and loads it again; test runs continue from the last checkpoint |
 | The prologue and the first missions | play: characters, textures, sky, sunlit exteriors, vehicles and boats; HUD, pause menu and pad input work. Played past the first boat mission (2026-11-25) |
-| Water | right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | **9 to 12 fps in rooms and light outdoor views**: 110 ms a frame in the first rooms at about 4,700 draws (run 275), 86 to 102 ms on the water at about 1,300 draws (run 279). **5 to 6 fps in heavy outdoor views** (160 to 208 ms at 7,200 to 9,700 draws). A frame is about 70 ms plus 13 ms per 1,000 draws: the thread that prepares submissions is the limit, the card idles 12 to 40 ms a frame. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md` plus `VICTORY_CARD_HASH_LEN=1`; the defaults are slower |
+| Water | **2026-11-27: no black or grey patches on open water** once the two 64-lane water programs (5dc3b25986622949, 6f225b641c5b0708) are no longer forced into the wave-wide form (leave them out of `VICTORY_WAVE_WIDE_ONLY`). Before: right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
+| Light in shadow | **2026-11-27: ray-traced shadows and light show with the builder on, after a scene has streamed in (minutes at the low frame rate; the first minutes still show stand-in models and black faces).** Without the builder (`VICTORY_BVH_BUILDER=0`) anything the sun does not hit directly is black |
+| Frame rate in the world | **2026-11-26 evening: usual world frame 131 ms at 3,300 to 4,100 draws with the card at 80 ms a frame (card hashing a group of 64 threads a piece, now the default; 149 ms and 108 ms of card without it, run 349).** Earlier: 8.2 to 8.6 world frames a second at the first boat mission at 3,000 to 5,000 draws, 9.5 over a whole standing run** (runs 311, 312, 315, 316: frames counted only where every frame is a world frame, not fades or loading screens), with the texture pass on its own thread (`VICTORY_HEAP_WORKER=1`; 6.2 to 6.7 without it). 10 to 14 fps at 500 to 1,500 draws. The thread that prepares submissions is the limit (about 70 ms of a usual frame); the card is at work about 9 ms. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md`; the defaults are slower |
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 02:15 UTC)
+### Newest (2026-11-27, 06:30 UTC)
+
+- **The structure builder's crash is fixed.** It was the title's own hang watchdog (a deliberate store to
+  address 0 after 30 s without a finished frame), not a bad pointer: the layer brought every copy of
+  title memory the builder had ever named up to date in every list, and snapshot, copied back and
+  compared up to 4 GiB per list, so no frame finished. Now a list syncs only the copies its own dispatches
+  name (and those shaders reached through pointers); translated shaders flag each 64 KiB page they store to,
+  and only those pages are declared written, kept from being overwritten by refreshes, and pulled back into
+  title memory (`VICTORY_MEMORY_SYNC_ALL=1` / `VICTORY_MEMORY_WHOLE_WRITES=1` restore the old ways). Up to
+  4,095 copies (was 1,023, used up in 3 s). A meter line every 5 s ("title memory by address: ...").
+- **Rays now see the structures:** a ray-tracing structure view has no resource, its address is in the
+  view description (`RaytracingAccelerationStructure.Location`); shaders were given address 0, read an
+  empty node and every ray missed. Instance and procedural nodes now return all ones as the hardware does
+  (AMD GPURT), not a miss.
+- **Result:** no crash past the builder (runs of 5 to 9 minutes); ray-traced shadows visible later in a run.
+  **But 0.2 to 3 frames a second while it runs:** each frame still syncs about 8 GB of copies (about 150 ms
+  of copying on the CPU; a frame shot showed the card idle 73 % of a 515 ms frame). Next: fewer copies (most
+  come from root constants that only look like addresses), and keeping the structures on the card.
+- Known: runs that slow end after 5 to 9 minutes in a crash in the title's own script code (a 16-byte copy
+  from a null pointer, title +0x3de6491); seen once before without the builder, also at a very low frame
+  rate.
+
+### Earlier (2026-11-27, 03:45 UTC)
+
+- **The ray-tracing structure builder runs** (`VICTORY_BVH_BUILDER`, now on by default; `=0` turns it
+  off): its last three programs, the group prefix sums, translate (a shared-memory read at a uniform
+  address counts as lane-uniform, after PR #36). **Known problem: about 30-40 s after the builder
+  starts, the title crashes on a write to address 0 (two runs, with and without
+  `VICTORY_BVH_QUARANTINE`).** Until that is traced, set `VICTORY_BVH_BUILDER=0` to play.
+- **Water:** the two water programs run in the paired wave64 form (pull request #1419 plus exact
+  reductions here; set `VICTORY_WAVE_PAIRS_ONLY=5dc3b25986622949,6f225b641c5b0708`,
+  `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`): the water has its green colour. The tile start values the
+  corner thread skips on an early return are now set by every thread first (`VICTORY_LDS_INIT_HOIST=0`
+  off), for the flickering dark tiles; not yet confirmed in a game run.
+- **New, off by default:** `VICTORY_GPU_DETILE` (textures detiled on the card), `VICTORY_INPLACE_CONSTANTS`
+  (the title's constants heap read by the card in place; did not open in its first run),
+  `VICTORY_PATCH_LEAN`, `VICTORY_DUMP_REFUSED=<dir>` (saves shaders that do not translate).
+
+### Earlier (2026-11-27, 01:20 UTC)
+
+- **The flights are no longer settled for title bytes changed under shader writes
+  (`VICTORY_MASKED_PATCH`, on by default):** a page with more changed runs than the merge's cap goes
+  to the card as a masked patch (offset, byte mask, value per dword) after the flights. In an on/off
+  split: waiting for the card 1 to 2 ms against 11 to 32, the usual frame 10 to 15 ms shorter.
+- **Indirect mesh draws are launched by an amplification stage (`VICTORY_MESH_LAUNCH`, on by default,
+  after pull request #1381):** no clamp pass before each record; the card 5 ms less a frame in an
+  on/off split. The translated mesh shaders follow the same switch (shader caches must be rebuilt).
+
+### Earlier (2026-11-27, 01:00 UTC)
+
+- **Measured (one run, 3,300 to 4,100 draws): usual world frame 101 to 105 ms, the card 58 to 61 ms**
+  (113 and 71 before). In it: the fast-math flag by default with `VICTORY_SHADER_FAST_BITS` 24 (no
+  signed zeros, reciprocal; NaN and infinity tests kept: no black blotches in the same shot that had
+  them with all flags), merge runs 4,096, joined copies, plain fills and step index on, 512 MiB of
+  scratch spares, joins of 16 parts and 128 lists, the texture checks ahead on 8 threads, pipeline
+  workers the logical processors less 4 (4 to 14), and open gather segments that outlive dispatches
+  until a barrier of the title's or the next indirect draw (`VICTORY_SEGMENTS_ACROSS`, on; measured
+  -3 ms of card and frame in an on/off split).
+- **Card losses:** three of them (one tonight 16 minutes into play) came 30 to 80 ms after the first
+  build of a `CS_RaytracingResolve` program (3 to 6 s each to make, and the pipeline library refuses
+  to keep them). `VICTORY_DENY_PIPELINES_FILE=<file>` skips the pipelines of the hashes in a file;
+  `diagnostics/deny-raytracing-resolve.txt` lists all 1,000 of that family. With ray node tests
+  answering "no hit" they have no hits to shade. Not yet proven over a long session.
+
+### Earlier (2026-11-27, 00:30 UTC)
+
+- **Measured (one run, 3,300 to 4,100 draws): usual world frame 113 ms, the card 71 ms** with the
+  wide raw loads guarded at a view's end, the fast-math flag off, the 4 MiB window grid, joins of 4
+  parts and 48 lists, texture room 90 % with 3,072 MB kept for targets, and the kept thread pool.
+- **Water:** the black and grey patches came from forcing the two water programs into the wave-wide
+  form. Left out, open water shows waves and the sun's path.
+- **Translator (shader caches must be rebuilt; keep `early-pipelines.txt`):** wide raw loads are on by
+  default and fall back to one load a dword where four would pass a heap view's end; `ds_bpermute`
+  reads within its own 32-lane half (after Belobug PR #363); pixel-shader quad swizzles read through
+  quad operations (after Belobug 03629f3f); a helper lane's first-lane read is its own value (after
+  upstream 0601955); NaN tests are made on the bits; `VICTORY_SHADER_FAST_BITS` picks the fast-math
+  flags (still off: all flags gave black blotches); ray node tests answer "no hit" by default
+  (`VICTORY_BVH_NO_HIT=0` off).
+- **Merged by hand:** #1397 (paired wave64 lowering, off; per program with `VICTORY_WAVE_PAIRS_ONLY`;
+  both water programs are refused by it today: "a floating-point reduction without an exact paired
+  tree"), #1399 (one GPU-write step per range per list), #1400 (lock-free empty slots, one-block
+  write faults, root constants on the stack), and a switch for #1392 (`VICTORY_NO_WAIT_PARTIAL=0`).
+- **New, off by default:** `VICTORY_CARD_FILLS` (constant buffers and copies where shaders wrote, on
+  the card; measured worse: usual frame +11 ms, card +6 ms), `VICTORY_MESH_LAUNCH` (#1381's idea,
+  from its HLSL), and a kept pool for the texture checks ahead (`VICTORY_KEPT_THREADS=0` off).
+
+### Earlier (2026-11-26, 23:15 UTC)
+
+- **Card hashing a group of 64 threads a piece is now the default (`VICTORY_CARD_HASH_WIDE=0` for the
+  old form):** the card's time a frame 80 ms against 108 ms at 3,300 to 4,100 draws, the usual world
+  frame 131 ms against 149 (two runs, different moments of the same mission: approximate).
+- **`VICTORY_TILES_SMALL_WHEN_FULL_MB` is 512 by default:** without it one run showed 612 textures black.
+- **Merged pull requests:** #1366 (failed fence waits are reported instead of passing as done), #1376
+  (texture read-backs re-registered after the title reuses their memory), #1380 (`clzero` on a guarded
+  line goes through the guard), #1367 (scratch chunks reused at any size; the spare cap is kept at 128
+  MiB here, `VICTORY_SCRATCH_SPARE_MB` raises it), #1392 (a never-filled texture with missing pages
+  is read with zeros for them), #1352 (`VICTORY_SPREAD_LEAN`, off), #1312 (a dispatch waits for its
+  compute pipeline: dark lamps after a fresh cache), and earlier today #1320, #1321, #1336, #1353.
+- **Translator:** raw loads ask only for the dwords that are read; `VICTORY_SHADER_OPT` bit 128 writes
+  the float operations with the fast-math flag (off: it puts black blotches on skin and
+  clothes, two runs with it and none without; the driver may fold the title's NaN tests away); a lane branch that only raises an LDS flag runs as two host waves (`VICTORY_LDS_FLAGS=0`
+  off).
+- **After a translator change keep `early-pipelines.txt`:** it holds keys only. Without it the first
+  minutes in the world are black while about 1,000 pipelines are made.
+
+### Earlier (2026-11-26, 11:50 UTC)
+
+- **Measured twice: a submission's texture checks side by side on the helper threads
+  (`VICTORY_PARALLEL_REFRESH=1`):** 8.7 and 9.4 ms less of the preparing thread's work a frame at equal
+  draws (two launches, switched on and off every 20 s); the checks run 3.6-3.8 times side by side.
+  With `VICTORY_SETTLE_ROOM=1` that is about 20 ms off that thread.
+- **Found: the frame's wall is now the graphics card.** With both on, the preparing thread works about
+  60 ms a frame at the boat but the card runs 84 to 128 ms a frame (by its own clock) and the frame does
+  not move: the two were nearly equal before. The card's time is spread over about 1,300 pipelines; the
+  translated programs are about 2.4 times the console's instruction count, broadly, with no single
+  cheap pattern. That is where the frame rate has to come from next.
+- **Measured at no gain, left off:** `VICTORY_WIDE_REFRESH`, `VICTORY_VIEW_KNOWN`, `VICTORY_CARD_HASH_WIDE`
+  (card time down, the preparing thread's up by more).
+- **The streaming of models is not held up on our side:** no DirectStorage request took a second; the
+  slowest was half a second. The stand-in models and the haze come from elsewhere (most likely the
+  title streaming per frame at a low frame rate; not proven).
+- The dispatch spread's switch is now `VICTORY_DISPATCH_SPREAD` (`VICTORY_SPREAD` is another feature's).
+
+### Earlier (2026-11-26, 10:40 UTC)
+
+- **Measured: flights get more room before they are settled (`VICTORY_SETTLE_ROOM=1`):** the thread
+  that prepares submissions waits for the card 4.6 ms a frame instead of 17.7 at the first boat
+  mission, 11.5 ms less of its work a frame at equal draws (one launch, switched on and off every
+  20 s). Off by default; the test set turns it on.
+- **Compute dispatches of more than 65,535 groups run spread across z** (after upstream VIctory pull
+  request #2312): the title asks for up to 115,200 groups (one per 32 pixels at 1440p) in a pass that
+  was cut to 65,535, losing 43 % of it. Tested on the card; costs nothing measurable. No visible change
+  yet (the pass most likely gathers ray-traced light, which does not run).
+- **Texture slots that read zeros for good are asked again (`VICTORY_REASK_BLANK=1`, diagnostics
+  builds):** at the boat the slots showing a copy with no level went from about 385 to 0.
+- **BC7 channel rotation only in modes 4 and 5** (upstream VIctory pull request #3111).
+- **Instruments:** reads held for the title's DirectStorage Submit (they wait about 40 ms, so not the
+  cause of the late models), the price of a failed write-watch asking, refreshes that copied nothing,
+  `VICTORY_DENY_PIPELINES` (a pipeline is never built), the ray-tracing builder's pipelines named.
+- **Measured at no gain, left off:** `VICTORY_NEAR_WRITES` (the work moved into the final flush),
+  `VICTORY_SYNC_BESIDE` (the two threads slow each other), `VICTORY_VIEW_KNOWN` (about 2 ms).
+
+### Earlier (2026-11-26, 09:00 UTC)
+
+- **Measured: the texture pass on a thread of its own (`VICTORY_HEAP_WORKER=1`, pull request #1007)
+  raises the world frame rate at the boat from 6.2 to 6.7 to 8.65, 9.50 and 9.53 frames a second**
+  (three launches each way). Still off by default; the test set turns it on.
+- **The legacy multiply-add runs as RDNA 2 runs it** (fused, sources flushed; pull request #1026):
+  the brightest water reflections no longer have black cores. Typed buffer views of 32-bit integer
+  formats are made as floats of the same width so the bits move unchanged (pull request #684).
+- **Instruments:** at a device removal the log now holds the sixteen seconds before it and the
+  pipelines first drawn with lately; the frame log counts world frames apart from fades and loading
+  screens; the placed texture slots are counted by what they show every 5 s (about 500 of 13,500 read
+  zeros at the boat).
+- **Off by default, for tests:** host objects let go on a thread of their own (`VICTORY_REAPER`), the
+  skin-bake draws' own textures uploaded before the draw (`VICTORY_BAKE_SOURCES`, pull request #1264),
+  slot rewrites let go at once (`VICTORY_RETIRE_LEAN`: measured slower, stays off).
+- This exact tree was played by the tester on 2026-11-26 (the build of runs 315, 316 and 318).
+
+### Earlier (2026-11-26, 02:15 UTC)
 
 - **Measured: `VICTORY_LOOKUP_CACHE=1` (pull request #1237) is worth about 14 ms a frame** on the
   test machine (run 293, the switch in turn, a fit at equal draw counts: 84 ms + 13.6 ms per 1,000
@@ -629,7 +793,7 @@ Rendering:
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Ray tracing, on by default and slow: the game's own structure-builder programs translate and run, title memory can be read and written by raw address from shaders (with written-page notes), the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and ray-traced shadows and light show in game since 2026-11-27, at 0.2 to 3 frames a second. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -648,7 +812,7 @@ Each is described in a comment where it is read.
 
 ### Known problems
 
-- Everything in shadow is black (see above).
+- With the ray-tracing builder on, the frame rate falls to 0.2 to 3 a second and the first minutes show stand-in models and black faces; without it (`VICTORY_BVH_BUILDER=0`), everything in shadow is black.
 - The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
 - Around 24 GB of memory is in use during play, about 16 GB of it in memory: the 32 GB test PC has about 1 to 5 GB free, and the 12 GB card is nearly full, so textures are let go and made again for lack of room.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
